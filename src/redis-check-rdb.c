@@ -27,10 +27,14 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mt19937-64.h"
 #include "server.h"
 #include "rdb.h"
 
 #include <stdarg.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 void createSharedObjects(void);
 void rdbLoadProgressCallback(rio *r, const void *buf, size_t len);
@@ -58,6 +62,8 @@ struct {
 #define RDB_CHECK_DOING_CHECK_SUM 5
 #define RDB_CHECK_DOING_READ_LEN 6
 #define RDB_CHECK_DOING_READ_AUX 7
+#define RDB_CHECK_DOING_READ_MODULE_AUX 8
+#define RDB_CHECK_DOING_READ_FUNCTIONS 9
 
 char *rdb_check_doing_string[] = {
     "start",
@@ -67,7 +73,9 @@ char *rdb_check_doing_string[] = {
     "read-object-value",
     "check-sum",
     "read-len",
-    "read-aux"
+    "read-aux",
+    "read-module-aux",
+    "read-functions"
 };
 
 char *rdb_type_string[] = {
@@ -77,15 +85,20 @@ char *rdb_type_string[] = {
     "zset-v1",
     "hash-hashtable",
     "zset-v2",
+    "module-pre-release",
     "module-value",
-    "","",
+    "",
     "hash-zipmap",
     "list-ziplist",
     "set-intset",
     "zset-ziplist",
     "hash-ziplist",
     "quicklist",
-    "stream"
+    "stream",
+    "hash-listpack",
+    "zset-listpack",
+    "quicklist-v2",
+    "set-listpack",
 };
 
 /* Show a few stats collected into 'rdbstate' */
@@ -123,7 +136,7 @@ void rdbCheckError(const char *fmt, ...) {
     rdbShowGenericInfo();
 }
 
-/* Print informations during RDB checking. */
+/* Print information during RDB checking. */
 void rdbCheckInfo(const char *fmt, ...) {
     char msg[1024];
     va_list ap;
@@ -170,22 +183,29 @@ void rdbCheckSetupSignals(void) {
     sigaction(SIGBUS, &act, NULL);
     sigaction(SIGFPE, &act, NULL);
     sigaction(SIGILL, &act, NULL);
+    sigaction(SIGABRT, &act, NULL);
 }
 
 /* Check the specified RDB file. Return 0 if the RDB looks sane, otherwise
  * 1 is returned.
- * The file is specified as a filename in 'rdbfilename' if 'fp' is not NULL,
+ * The file is specified as a filename in 'rdbfilename' if 'fp' is NULL,
  * otherwise the already open file 'fp' is checked. */
 int redis_check_rdb(char *rdbfilename, FILE *fp) {
     uint64_t dbid;
+    int selected_dbid = -1;
     int type, rdbver;
     char buf[1024];
     long long expiretime, now = mstime();
     static rio rdb; /* Pointed by global struct riostate. */
+    struct stat sb;
 
     int closefile = (fp == NULL);
     if (fp == NULL && (fp = fopen(rdbfilename,"r")) == NULL) return 1;
 
+    if (fstat(fileno(fp), &sb) == -1)
+        sb.st_size = 0;
+
+    startLoadingFile(sb.st_size, rdbfilename, RDBFLAGS_NONE);
     rioInitWithFile(&rdb,fp);
     rdbstate.rio = &rdb;
     rdb.update_cksum = rdbLoadProgressCallback;
@@ -202,7 +222,6 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
     }
 
     expiretime = -1;
-    startLoadingFile(fp, rdbfilename, RDBFLAGS_NONE);
     while(1) {
         robj *key, *val;
 
@@ -244,7 +263,8 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
             rdbstate.doing = RDB_CHECK_DOING_READ_LEN;
             if ((dbid = rdbLoadLen(&rdb,NULL)) == RDB_LENERR)
                 goto eoferr;
-            rdbCheckInfo("Selecting DB ID %d", dbid);
+            rdbCheckInfo("Selecting DB ID %llu", (unsigned long long)dbid);
+            selected_dbid = dbid;
             continue; /* Read type again. */
         } else if (type == RDB_OPCODE_RESIZEDB) {
             /* RESIZEDB: Hint about the size of the keys in the currently
@@ -259,19 +279,53 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
         } else if (type == RDB_OPCODE_AUX) {
             /* AUX: generic string-string fields. Use to add state to RDB
              * which is backward compatible. Implementations of RDB loading
-             * are requierd to skip AUX fields they don't understand.
+             * are required to skip AUX fields they don't understand.
              *
              * An AUX field is composed of two strings: key and value. */
             robj *auxkey, *auxval;
             rdbstate.doing = RDB_CHECK_DOING_READ_AUX;
             if ((auxkey = rdbLoadStringObject(&rdb)) == NULL) goto eoferr;
-            if ((auxval = rdbLoadStringObject(&rdb)) == NULL) goto eoferr;
+            if ((auxval = rdbLoadStringObject(&rdb)) == NULL) {
+                decrRefCount(auxkey);
+                goto eoferr;
+            }
 
             rdbCheckInfo("AUX FIELD %s = '%s'",
                 (char*)auxkey->ptr, (char*)auxval->ptr);
             decrRefCount(auxkey);
             decrRefCount(auxval);
             continue; /* Read type again. */
+        } else if (type == RDB_OPCODE_MODULE_AUX) {
+            /* AUX: Auxiliary data for modules. */
+            uint64_t moduleid, when_opcode, when;
+            rdbstate.doing = RDB_CHECK_DOING_READ_MODULE_AUX;
+            if ((moduleid = rdbLoadLen(&rdb,NULL)) == RDB_LENERR) goto eoferr;
+            if ((when_opcode = rdbLoadLen(&rdb,NULL)) == RDB_LENERR) goto eoferr;
+            if ((when = rdbLoadLen(&rdb,NULL)) == RDB_LENERR) goto eoferr;
+            if (when_opcode != RDB_MODULE_OPCODE_UINT) {
+                rdbCheckError("bad when_opcode");
+                goto err;
+            }
+
+            char name[10];
+            moduleTypeNameByID(name,moduleid);
+            rdbCheckInfo("MODULE AUX for: %s", name);
+
+            robj *o = rdbLoadCheckModuleValue(&rdb,name);
+            decrRefCount(o);
+            continue; /* Read type again. */
+        } else if (type == RDB_OPCODE_FUNCTION_PRE_GA) {
+            rdbCheckError("Pre-release function format not supported %d",rdbver);
+            goto err;
+        } else if (type == RDB_OPCODE_FUNCTION2) {
+            sds err = NULL;
+            rdbstate.doing = RDB_CHECK_DOING_READ_FUNCTIONS;
+            if (rdbFunctionLoad(&rdb, rdbver, NULL, 0, &err) != C_OK) {
+                rdbCheckError("Failed loading library, %s", err);
+                sdsfree(err);
+                goto err;
+            }
+            continue;
         } else {
             if (!rdbIsObjectType(type)) {
                 rdbCheckError("Invalid object type: %d", type);
@@ -287,7 +341,7 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
         rdbstate.keys++;
         /* Read value */
         rdbstate.doing = RDB_CHECK_DOING_READ_OBJECT_VALUE;
-        if ((val = rdbLoadObject(type,&rdb,key)) == NULL) goto eoferr;
+        if ((val = rdbLoadObject(type,&rdb,key->ptr,selected_dbid,NULL)) == NULL) goto eoferr;
         /* Check if the key already expired. */
         if (expiretime != -1 && expiretime < now)
             rdbstate.already_expired++;
@@ -331,7 +385,21 @@ err:
     return 1;
 }
 
-/* RDB check main: called form redis.c when Redis is executed with the
+static sds checkRdbVersion(void) {
+    sds version;
+    version = sdscatprintf(sdsempty(), "%s", REDIS_VERSION);
+
+    /* Add git commit and working tree status when available */
+    if (strtoll(redisGitSHA1(),NULL,16)) {
+        version = sdscatprintf(version, " (git:%s", redisGitSHA1());
+        if (strtoll(redisGitDirty(),NULL,10))
+            version = sdscatprintf(version, "-dirty");
+        version = sdscat(version, ")");
+    }
+    return version;
+}
+
+/* RDB check main: called form server.c when Redis is executed with the
  * redis-check-rdb alias, on during RDB loading errors.
  *
  * The function works in two ways: can be called with argc/argv as a
@@ -344,16 +412,28 @@ err:
  * Otherwise if called with a non NULL fp, the function returns C_OK or
  * C_ERR depending on the success or failure. */
 int redis_check_rdb_main(int argc, char **argv, FILE *fp) {
+    struct timeval tv;
+
     if (argc != 2 && fp == NULL) {
         fprintf(stderr, "Usage: %s <rdb-file-name>\n", argv[0]);
         exit(1);
+    } else if (!strcmp(argv[1],"-v") || !strcmp(argv[1], "--version")) {
+        sds version = checkRdbVersion();
+        printf("redis-check-rdb %s\n", version);
+        sdsfree(version);
+        exit(0);
     }
+
+    gettimeofday(&tv, NULL);
+    init_genrand64(((long long) tv.tv_sec * 1000000 + tv.tv_usec) ^ getpid());
+
     /* In order to call the loading functions we need to create the shared
      * integer objects, however since this function may be called from
      * an already initialized Redis instance, check if we really need to. */
     if (shared.integers[0] == NULL)
         createSharedObjects();
     server.loading_process_events_interval_bytes = 0;
+    server.sanitize_dump_payload = SANITIZE_DUMP_YES;
     rdbCheckMode = 1;
     rdbCheckInfo("Checking RDB file %s", argv[1]);
     rdbCheckSetupSignals();

@@ -57,7 +57,10 @@ static int label_margin_top = 1;
 struct sequence *createSparklineSequence(void) {
     struct sequence *seq = zmalloc(sizeof(*seq));
     seq->length = 0;
+    seq->labels = 0;
     seq->samples = NULL;
+    seq->min = 0.0f;
+    seq->max = 0.0f;
     return seq;
 }
 
@@ -92,7 +95,7 @@ void freeSparklineSequence(struct sequence *seq) {
  * ------------------------------------------------------------------------- */
 
 /* Render part of a sequence, so that render_sequence() call call this function
- * with differnent parts in order to create the full output without overflowing
+ * with different parts in order to create the full output without overflowing
  * the current terminal columns. */
 sds sparklineRenderRange(sds output, struct sequence *seq, int rows, int offset, int len, int flags) {
     int j;

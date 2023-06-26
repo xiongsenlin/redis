@@ -6,7 +6,9 @@ package require Tcl 8.5
 
 set tcl_precision 17
 source tests/support/redis.tcl
+source tests/support/aofmanifest.tcl
 source tests/support/server.tcl
+source tests/support/cluster_util.tcl
 source tests/support/tmpfile.tcl
 source tests/support/test.tcl
 source tests/support/util.tcl
@@ -18,6 +20,8 @@ set ::all_tests {
     unit/protocol
     unit/keyspace
     unit/scan
+    unit/info
+    unit/info-command
     unit/type/string
     unit/type/incr
     unit/type/list
@@ -35,21 +39,39 @@ set ::all_tests {
     unit/quit
     unit/aofrw
     unit/acl
+    unit/acl-v2
+    unit/latency-monitor
     integration/block-repl
     integration/replication
     integration/replication-2
     integration/replication-3
     integration/replication-4
     integration/replication-psync
+    integration/replication-buffer
+    integration/shutdown
     integration/aof
+    integration/aof-race
+    integration/aof-multi-part
     integration/rdb
+    integration/corrupt-dump
+    integration/corrupt-dump-fuzzer
     integration/convert-zipmap-hash-on-load
+    integration/convert-ziplist-hash-on-load
+    integration/convert-ziplist-zset-on-load
     integration/logging
     integration/psync2
     integration/psync2-reg
+    integration/psync2-pingoff
+    integration/psync2-master-restart
+    integration/failover
+    integration/redis-cli
+    integration/redis-benchmark
+    integration/dismiss-mem
     unit/pubsub
+    unit/pubsubshard
     unit/slowlog
     unit/scripting
+    unit/functions
     unit/maxmemory
     unit/introspection
     unit/introspection-2
@@ -62,39 +84,71 @@ set ::all_tests {
     unit/hyperloglog
     unit/lazyfree
     unit/wait
-    unit/pendingquerybuf
+    unit/pause
+    unit/querybuf
     unit/tls
+    unit/tracking
+    unit/oom-score-adj
+    unit/shutdown
+    unit/networking
+    unit/client-eviction
+    unit/violations
+    unit/replybufsize
+    unit/cluster/misc
+    unit/cluster/cli
+    unit/cluster/scripting
+    unit/cluster/hostnames
+    unit/cluster/human-announced-nodename
+    unit/cluster/multi-slot-operations
+    unit/cluster/slot-ownership
+    unit/cluster/links
 }
 # Index to the next test to run in the ::all_tests list.
 set ::next_test 0
 
 set ::host 127.0.0.1
-set ::port 21111
+set ::port 6379; # port for external server
+set ::baseport 21111; # initial port for spawned redis servers
+set ::portcount 8000; # we don't wanna use more than 10000 to avoid collision with cluster bus ports
 set ::traceleaks 0
 set ::valgrind 0
+set ::durable 0
 set ::tls 0
+set ::tls_module 0
 set ::stack_logging 0
 set ::verbose 0
 set ::quiet 0
 set ::denytags {}
 set ::skiptests {}
+set ::skipunits {}
+set ::no_latency 0
 set ::allowtags {}
 set ::only_tests {}
 set ::single_tests {}
+set ::run_solo_tests {}
 set ::skip_till ""
 set ::external 0; # If "1" this means, we are running against external instance
 set ::file ""; # If set, runs only the tests in this comma separated list
 set ::curfile ""; # Hold the filename of the current suite
 set ::accurate 0; # If true runs fuzz tests with more iterations
 set ::force_failure 0
-set ::timeout 600; # 10 minutes without progresses will quit the test.
+set ::timeout 1200; # 20 minutes without progresses will quit the test.
 set ::last_progress [clock seconds]
 set ::active_servers {} ; # Pids of active Redis instances.
 set ::dont_clean 0
+set ::dont_pre_clean 0
 set ::wait_server 0
 set ::stop_on_failure 0
+set ::dump_logs 0
 set ::loop 0
 set ::tlsdir "tests/tls"
+set ::singledb 0
+set ::cluster_mode 0
+set ::ignoreencoding 0
+set ::ignoredigest 0
+set ::large_memory 0
+set ::log_req_res 0
+set ::force_resp3 0
 
 # Set to 1 when we are running in client mode. The Redis test uses a
 # server-client model to run tests simultaneously. The server instance
@@ -104,11 +158,26 @@ set ::tlsdir "tests/tls"
 set ::client 0
 set ::numclients 16
 
-proc execute_tests name {
-    set path "tests/$name.tcl"
+# This function is called by one of the test clients when it receives
+# a "run" command from the server, with a filename as data.
+# It will run the specified test source file and signal it to the
+# test server when finished.
+proc execute_test_file __testname {
+    set path "tests/$__testname.tcl"
     set ::curfile $path
     source $path
-    send_data_packet $::test_server_fd done "$name"
+    send_data_packet $::test_server_fd done "$__testname"
+}
+
+# This function is called by one of the test clients when it receives
+# a "run_code" command from the server, with a verbatim test source code
+# as argument, and an associated name.
+# It will run the specified code and signal it to the test server when
+# finished.
+proc execute_test_code {__testname filename code} {
+    set ::curfile $filename
+    eval $code
+    send_data_packet $::test_server_fd done "$__testname"
 }
 
 # Setup a list to hold a stack of server configs. When calls to start_server
@@ -139,6 +208,18 @@ proc r {args} {
     [srv $level "client"] {*}$args
 }
 
+# Returns a Redis instance by index.
+proc Rn {n} {
+    set level [expr -1*$n]
+    return [srv $level "client"]
+}
+
+# Provide easy access to a client for an inner server. Requires a positive
+# index, unlike r which uses an optional negative index.
+proc R {n args} {
+    [Rn $n] {*}$args
+}
+
 proc reconnect {args} {
     set level [lindex $args 0]
     if {[string length $level] == 0 || ![string is integer $level]} {
@@ -150,10 +231,14 @@ proc reconnect {args} {
     set port [dict get $srv "port"]
     set config [dict get $srv "config"]
     set client [redis $host $port 0 $::tls]
+    if {[dict exists $srv "client"]} {
+        set old [dict get $srv "client"]
+        $old close
+    }
     dict set srv "client" $client
 
     # select the right db when we don't have to authenticate
-    if {![dict exists $config "requirepass"]} {
+    if {![dict exists $config "requirepass"] && !$::singledb} {
         $client select 9
     }
 
@@ -172,8 +257,34 @@ proc redis_deferring_client {args} {
     set client [redis [srv $level "host"] [srv $level "port"] 1 $::tls]
 
     # select the right db and read the response (OK)
-    $client select 9
-    $client read
+    if {!$::singledb} {
+        $client select 9
+        $client read
+    } else {
+        # For timing/symmetry with the above select
+        $client ping
+        $client read
+    }
+    return $client
+}
+
+proc redis_client {args} {
+    set level 0
+    if {[llength $args] > 0 && [string is integer [lindex $args 0]]} {
+        set level [lindex $args 0]
+        set args [lrange $args 1 end]
+    }
+
+    # create client that defers reading reply
+    set client [redis [srv $level "host"] [srv $level "port"] 0 $::tls]
+
+    # select the right db and read the response (OK), or at least ping
+    # the server if we're in a singledb mode.
+    if {$::singledb} {
+        $client ping
+    } else {
+        $client select 9
+    }
     return $client
 }
 
@@ -187,10 +298,24 @@ proc s {args} {
     status [srv $level "client"] [lindex $args 0]
 }
 
-proc cleanup {} {
-    if {$::dont_clean} {
+# Get the specified field from the givens instances cluster info output.
+proc CI {index field} {
+    getInfoProperty [R $index cluster info] $field
+}
+
+# Test wrapped into run_solo are sent back from the client to the
+# test server, so that the test server will send them again to
+# clients once the clients are idle.
+proc run_solo {name code} {
+    if {$::numclients == 1 || $::loop || $::external} {
+        # run_solo is not supported in these scenarios, just run the code.
+        eval $code
         return
     }
+    send_data_packet $::test_server_fd run_solo [list $name $::curfile $code]
+}
+
+proc cleanup {} {
     if {!$::quiet} {puts -nonewline "Cleanup: may take some time... "}
     flush stdout
     catch {exec rm -rf {*}[glob tests/tmp/redis.conf.*]}
@@ -199,25 +324,31 @@ proc cleanup {} {
 }
 
 proc test_server_main {} {
-    cleanup
+    if {!$::dont_pre_clean} cleanup
     set tclsh [info nameofexecutable]
     # Open a listening socket, trying different ports in order to find a
     # non busy one.
-    set port [find_available_port 11111]
+    set clientport [find_available_port [expr {$::baseport - 32}] 32]
     if {!$::quiet} {
-        puts "Starting test server at port $port"
+        puts "Starting test server at port $clientport"
     }
-    socket -server accept_test_clients  -myaddr 127.0.0.1 $port
+    socket -server accept_test_clients  -myaddr 127.0.0.1 $clientport
 
     # Start the client instances
     set ::clients_pids {}
-    set start_port [expr {$::port+100}]
-    for {set j 0} {$j < $::numclients} {incr j} {
-        set start_port [find_available_port $start_port]
+    if {$::external} {
         set p [exec $tclsh [info script] {*}$::argv \
-            --client $port --port $start_port &]
+            --client $clientport &]
         lappend ::clients_pids $p
-        incr start_port 10
+    } else {
+        set start_port $::baseport
+        set port_count [expr {$::portcount / $::numclients}]
+        for {set j 0} {$j < $::numclients} {incr j} {
+            set p [exec $tclsh [info script] {*}$::argv \
+                --client $clientport --baseport $start_port --portcount $port_count &]
+            lappend ::clients_pids $p
+            incr start_port $port_count
+        }
     }
 
     # Setup global state for the test server
@@ -273,7 +404,7 @@ proc accept_test_clients {fd addr port} {
 proc read_from_test_client fd {
     set bytes [gets $fd]
     set payload [read $fd $bytes]
-    foreach {status data} $payload break
+    foreach {status data elapsed} $payload break
     set ::last_progress [clock seconds]
 
     if {$status eq {ready}} {
@@ -289,10 +420,10 @@ proc read_from_test_client fd {
         puts "\[$completed_tests_count/$all_tests_count [colorstr yellow $status]\]: $data ($elapsed seconds)"
         lappend ::clients_time_history $elapsed $data
         signal_idle_client $fd
-        set ::active_clients_task($fd) DONE
+        set ::active_clients_task($fd) "(DONE) $data"
     } elseif {$status eq {ok}} {
         if {!$::quiet} {
-            puts "\[[colorstr green $status]\]: $data"
+            puts "\[[colorstr green $status]\]: $data ($elapsed ms)"
         }
         set ::active_clients_task($fd) "(OK) $data"
     } elseif {$status eq {skip}} {
@@ -308,8 +439,8 @@ proc read_from_test_client fd {
         puts $err
         lappend ::failed_tests $err
         set ::active_clients_task($fd) "(ERR) $data"
-            if {$::stop_on_failure} {
-            puts -nonewline "(Test stopped, press enter to continue)"
+        if {$::stop_on_failure} {
+            puts -nonewline "(Test stopped, press enter to resume the tests)"
             flush stdout
             gets stdin
         }
@@ -320,10 +451,18 @@ proc read_from_test_client fd {
         exit 1
     } elseif {$status eq {testing}} {
         set ::active_clients_task($fd) "(IN PROGRESS) $data"
+    } elseif {$status eq {server-spawning}} {
+        set ::active_clients_task($fd) "(SPAWNING SERVER) $data"
     } elseif {$status eq {server-spawned}} {
         lappend ::active_servers $data
+        set ::active_clients_task($fd) "(SPAWNED SERVER) pid:$data"
+    } elseif {$status eq {server-killing}} {
+        set ::active_clients_task($fd) "(KILLING SERVER) pid:$data"
     } elseif {$status eq {server-killed}} {
         set ::active_servers [lsearch -all -inline -not -exact $::active_servers $data]
+        set ::active_clients_task($fd) "(KILLED SERVER) pid:$data"
+    } elseif {$status eq {run_solo}} {
+        lappend ::run_solo_tests $data
     } else {
         if {!$::quiet} {
             puts "\[$status\]: $data"
@@ -333,7 +472,7 @@ proc read_from_test_client fd {
 
 proc show_clients_state {} {
     # The following loop is only useful for debugging tests that may
-    # enter an infinite loop. Commented out normally.
+    # enter an infinite loop.
     foreach x $::active_clients {
         if {[info exist ::active_clients_task($x)]} {
             puts "$x => $::active_clients_task($x)"
@@ -356,14 +495,25 @@ proc force_kill_all_servers {} {
     }
 }
 
+proc lpop {listVar {count 1}} {
+    upvar 1 $listVar l
+    set ele [lindex $l 0]
+    set l [lrange $l 1 end]
+    set ele
+}
+
+proc lremove {listVar value} {
+    upvar 1 $listVar var
+    set idx [lsearch -exact $var $value]
+    set var [lreplace $var $idx $idx]
+}
+
 # A new client is idle. Remove it from the list of active clients and
 # if there are still test units to run, launch them.
 proc signal_idle_client fd {
     # Remove this fd from the list of active clients.
     set ::active_clients \
         [lsearch -all -inline -not -exact $::active_clients $fd]
-
-    if 0 {show_clients_state}
 
     # New unit to process?
     if {$::next_test != [llength $::all_tests]} {
@@ -377,9 +527,19 @@ proc signal_idle_client fd {
         incr ::next_test
         if {$::loop && $::next_test == [llength $::all_tests]} {
             set ::next_test 0
+            incr ::loop -1
         }
+    } elseif {[llength $::run_solo_tests] != 0 && [llength $::active_clients] == 0} {
+        if {!$::quiet} {
+            puts [colorstr bold-white "Testing solo test"]
+            set ::active_clients_task($fd) "ASSIGNED: $fd solo test"
+        }
+        set ::clients_start_time($fd) [clock seconds]
+        send_data_packet $fd run_code [lpop ::run_solo_tests]
+        lappend ::active_clients $fd
     } else {
         lappend ::idle_clients $fd
+        set ::active_clients_task($fd) "SLEEPING, no more units to assign"
         if {[llength $::active_clients] == 0} {
             the_end
         }
@@ -389,7 +549,7 @@ proc signal_idle_client fd {
 # The the_end function gets called when all the test units were already
 # executed, so the test finished.
 proc the_end {} {
-    # TODO: print the status, exit with the rigth exit code.
+    # TODO: print the status, exit with the right exit code.
     puts "\n                   The End\n"
     puts "Execution time of different units:"
     foreach {time name} $::clients_time_history {
@@ -400,11 +560,11 @@ proc the_end {} {
         foreach failed $::failed_tests {
             puts "*** $failed"
         }
-        cleanup
+        if {!$::dont_clean} cleanup
         exit 1
     } else {
         puts "\n[colorstr bold-white {\o/}] [colorstr bold-green {All tests passed without errors!}]\n"
-        cleanup
+        if {!$::dont_clean} cleanup
         exit 0
     }
 }
@@ -420,15 +580,18 @@ proc test_client_main server_port {
         set payload [read $::test_server_fd $bytes]
         foreach {cmd data} $payload break
         if {$cmd eq {run}} {
-            execute_tests $data
+            execute_test_file $data
+        } elseif {$cmd eq {run_code}} {
+            foreach {name filename code} $data break
+            execute_test_code $name $filename $code
         } else {
             error "Unknown test client command: $cmd"
         }
     }
 }
 
-proc send_data_packet {fd status data} {
-    set payload [list $status $data]
+proc send_data_packet {fd status data {elapsed 0}} {
+    set payload [list $status $data $elapsed]
     puts $fd [string length $payload]
     puts -nonewline $fd $payload
     flush $fd
@@ -437,23 +600,42 @@ proc send_data_packet {fd status data} {
 proc print_help_screen {} {
     puts [join {
         "--valgrind         Run the test over valgrind."
+        "--durable          suppress test crashes and keep running"
         "--stack-logging    Enable OSX leaks/malloc stack logging."
         "--accurate         Run slow randomized tests for more iterations."
         "--quiet            Don't show individual tests."
-        "--single <unit>    Just execute the specified unit (see next option). this option can be repeated."
+        "--single <unit>    Just execute the specified unit (see next option). This option can be repeated."
+        "--verbose          Increases verbosity."
         "--list-tests       List all the available test units."
-        "--only <test>      Just execute the specified test by test name. this option can be repeated."
+        "--only <test>      Just execute the specified test by test name or tests that match <test> regexp (if <test> starts with '/'). This option can be repeated."
         "--skip-till <unit> Skip all units until (and including) the specified one."
+        "--skipunit <unit>  Skip one unit."
         "--clients <num>    Number of test clients (default 16)."
-        "--timeout <sec>    Test timeout in seconds (default 10 min)."
+        "--timeout <sec>    Test timeout in seconds (default 20 min)."
         "--force-failure    Force the execution of a test that always fails."
         "--config <k> <v>   Extra config file argument."
-        "--skipfile <file>  Name of a file containing test names that should be skipped (one per line)."
+        "--skipfile <file>  Name of a file containing test names or regexp patterns (if <test> starts with '/') that should be skipped (one per line). This option can be repeated."
+        "--skiptest <test>  Test name or regexp pattern (if <test> starts with '/') to skip. This option can be repeated."
+        "--tags <tags>      Run only tests having specified tags or not having '-' prefixed tags."
         "--dont-clean       Don't delete redis log files after the run."
+        "--dont-pre-clean   Don't delete existing redis log files before the run."
+        "--no-latency       Skip latency measurements and validation by some tests."
         "--stop             Blocks once the first test fails."
         "--loop             Execute the specified set of tests forever."
+        "--loops <count>    Execute the specified set of tests several times."
         "--wait-server      Wait after server is started (so that you can attach a debugger)."
+        "--dump-logs        Dump server log on test failure."
         "--tls              Run tests in TLS mode."
+        "--tls-module       Run tests in TLS mode with Redis module."
+        "--host <addr>      Run tests against an external host."
+        "--port <port>      TCP port to use against external host."
+        "--baseport <port>  Initial port number for spawned redis servers."
+        "--portcount <num>  Port range for spawned redis servers."
+        "--singledb         Use a single database, avoid SELECT."
+        "--cluster-mode     Run tests in cluster protocol compatible mode."
+        "--ignore-encoding  Don't validate object encoding."
+        "--ignore-digest    Don't use debug digest validations."
+        "--large-memory     Run tests using over 100mb."
         "--help             Print this help screen."
     } "\n"]
 }
@@ -476,12 +658,19 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         lappend ::global_overrides $arg
         lappend ::global_overrides $arg2
         incr j 2
+    } elseif {$opt eq {--log-req-res}} {
+        set ::log_req_res 1
+    } elseif {$opt eq {--force-resp3}} {
+        set ::force_resp3 1
     } elseif {$opt eq {--skipfile}} {
         incr j
         set fp [open $arg r]
         set file_data [read $fp]
         close $fp
-        set ::skiptests [split $file_data "\n"]
+        set ::skiptests [concat $::skiptests [split $file_data "\n"]]
+    } elseif {$opt eq {--skiptest}} {
+        lappend ::skiptests $arg
+        incr j
     } elseif {$opt eq {--valgrind}} {
         set ::valgrind 1
     } elseif {$opt eq {--stack-logging}} {
@@ -490,19 +679,28 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         }
     } elseif {$opt eq {--quiet}} {
         set ::quiet 1
-    } elseif {$opt eq {--tls}} {
+    } elseif {$opt eq {--tls} || $opt eq {--tls-module}} {
         package require tls 1.6
         set ::tls 1
         ::tls::init \
             -cafile "$::tlsdir/ca.crt" \
-            -certfile "$::tlsdir/redis.crt" \
-            -keyfile "$::tlsdir/redis.key"
+            -certfile "$::tlsdir/client.crt" \
+            -keyfile "$::tlsdir/client.key"
+        if {$opt eq {--tls-module}} {
+            set ::tls_module 1
+        }
     } elseif {$opt eq {--host}} {
         set ::external 1
         set ::host $arg
         incr j
     } elseif {$opt eq {--port}} {
         set ::port $arg
+        incr j
+    } elseif {$opt eq {--baseport}} {
+        set ::baseport $arg
+        incr j
+    } elseif {$opt eq {--portcount}} {
+        set ::portcount $arg
         incr j
     } elseif {$opt eq {--accurate}} {
         set ::accurate 1
@@ -514,6 +712,9 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
     } elseif {$opt eq {--only}} {
         lappend ::only_tests $arg
         incr j
+    } elseif {$opt eq {--skipunit}} {
+        lappend ::skipunits $arg
+        incr j
     } elseif {$opt eq {--skip-till}} {
         set ::skip_till $arg
         incr j
@@ -523,7 +724,7 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         }
         exit 0
     } elseif {$opt eq {--verbose}} {
-        set ::verbose 1
+        incr ::verbose
     } elseif {$opt eq {--client}} {
         set ::client 1
         set ::test_server_port $arg
@@ -531,17 +732,39 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
     } elseif {$opt eq {--clients}} {
         set ::numclients $arg
         incr j
+    } elseif {$opt eq {--durable}} {
+        set ::durable 1
     } elseif {$opt eq {--dont-clean}} {
         set ::dont_clean 1
+    } elseif {$opt eq {--dont-pre-clean}} {
+        set ::dont_pre_clean 1
+    } elseif {$opt eq {--no-latency}} {
+        set ::no_latency 1
     } elseif {$opt eq {--wait-server}} {
         set ::wait_server 1
+    } elseif {$opt eq {--dump-logs}} {
+        set ::dump_logs 1
     } elseif {$opt eq {--stop}} {
         set ::stop_on_failure 1
     } elseif {$opt eq {--loop}} {
-        set ::loop 1
+        set ::loop 2147483647
+    } elseif {$opt eq {--loops}} {
+        set ::loop $arg
+        incr j
     } elseif {$opt eq {--timeout}} {
         set ::timeout $arg
         incr j
+    } elseif {$opt eq {--singledb}} {
+        set ::singledb 1
+    } elseif {$opt eq {--cluster-mode}} {
+        set ::cluster_mode 1
+        set ::singledb 1
+    } elseif {$opt eq {--large-memory}} {
+        set ::large_memory 1
+    } elseif {$opt eq {--ignore-encoding}} {
+        set ::ignoreencoding 1
+    } elseif {$opt eq {--ignore-digest}} {
+        set ::ignoredigest 1
     } elseif {$opt eq {--help}} {
         print_help_screen
         exit 0
@@ -551,13 +774,23 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
     }
 }
 
-# If --skil-till option was given, we populate the list of single tests
+set filtered_tests {}
+
+# Set the filtered tests to be the short list (single_tests) if exists.
+# Otherwise, we start filtering all_tests
+if {[llength $::single_tests] > 0} {
+    set filtered_tests $::single_tests
+} else {
+    set filtered_tests $::all_tests
+}
+
+# If --skip-till option was given, we populate the list of single tests
 # to run with everything *after* the specified unit.
 if {$::skip_till != ""} {
     set skipping 1
     foreach t $::all_tests {
-        if {$skipping == 0} {
-            lappend ::single_tests $t
+        if {$skipping == 1} {
+            lremove filtered_tests $t
         }
         if {$t == $::skip_till} {
             set skipping 0
@@ -569,17 +802,28 @@ if {$::skip_till != ""} {
     }
 }
 
-# Override the list of tests with the specific tests we want to run
-# in case there was some filter, that is --single or --skip-till options.
-if {[llength $::single_tests] > 0} {
-    set ::all_tests $::single_tests
+# If --skipunits option was given, we populate the list of single tests
+# to run with everything *not* in the skipunits list.
+if {[llength $::skipunits] > 0} {
+    foreach t $::all_tests {
+        if {[lsearch $::skipunits $t] != -1} {
+            lremove filtered_tests $t
+        }
+    }
 }
 
-proc attach_to_replication_stream {} {
+# Override the list of tests with the specific tests we want to run
+# in case there was some filter, that is --single, -skipunit or --skip-till options.
+if {[llength $filtered_tests] < [llength $::all_tests]} {
+    set ::all_tests $filtered_tests
+}
+
+proc attach_to_replication_stream_on_connection {conn} {
+    r config set repl-ping-replica-period 3600
     if {$::tls} {
-        set s [::tls::socket [srv 0 "host"] [srv 0 "port"]]
+        set s [::tls::socket [srv $conn "host"] [srv $conn "port"]]
     } else {
-        set s [socket [srv 0 "host"] [srv 0 "port"]]
+        set s [socket [srv $conn "host"] [srv $conn "port"]]
     }
     fconfigure $s -translation binary
     puts -nonewline $s "SYNC\r\n"
@@ -604,6 +848,10 @@ proc attach_to_replication_stream {} {
     return $s
 }
 
+proc attach_to_replication_stream {} {
+    return [attach_to_replication_stream_on_connection 0]
+}
+
 proc read_from_replication_stream {s} {
     fconfigure $s -blocking 0
     set attempt 0
@@ -626,13 +874,28 @@ proc read_from_replication_stream {s} {
 }
 
 proc assert_replication_stream {s patterns} {
+    set errors 0
+    set values_list {}
+    set patterns_list {}
     for {set j 0} {$j < [llength $patterns]} {incr j} {
-        assert_match [lindex $patterns $j] [read_from_replication_stream $s]
+        set pattern [lindex $patterns $j]
+        lappend patterns_list $pattern
+        set value [read_from_replication_stream $s]
+        lappend values_list $value
+        if {![string match $pattern $value]} { incr errors }
     }
+
+    if {$errors == 0} { return }
+
+    set context [info frame -1]
+    close_replication_stream $s ;# for fast exit
+    assert_match $patterns_list $values_list "" $context
 }
 
 proc close_replication_stream {s} {
     close $s
+    r config set repl-ping-replica-period 10
+    return
 }
 
 # With the parallel test running multiple Redis instances at the same time

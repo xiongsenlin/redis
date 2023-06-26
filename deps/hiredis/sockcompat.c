@@ -180,9 +180,16 @@ int win32_connect(SOCKET sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
     /* For Winsock connect(), the WSAEWOULDBLOCK error means the same thing as
      * EINPROGRESS for POSIX connect(), so we do that translation to keep POSIX
-     * logic consistent. */
-    if (errno == EWOULDBLOCK) {
+     * logic consistent.
+     * Additionally, WSAALREADY is can be reported as WSAEINVAL to  and this is
+     * translated to EIO.  Convert appropriately
+     */
+    int err = errno;
+    if (err == EWOULDBLOCK) {
         errno = EINPROGRESS;
+    }
+    else if (err == EIO) {
+        errno = EALREADY;
     }
 
     return ret != SOCKET_ERROR ? ret : -1;
@@ -205,6 +212,14 @@ int win32_getsockopt(SOCKET sockfd, int level, int optname, void *optval, sockle
     } else {
         ret = getsockopt(sockfd, level, optname, (char*)optval, optlen);
     }
+    if (ret != SOCKET_ERROR && level == SOL_SOCKET && optname == SO_ERROR) {
+        /* translate SO_ERROR codes, if non-zero */
+        int err = *(int*)optval;
+        if (err != 0) {
+            err = _wsaErrorToErrno(err);
+            *(int*)optval = err;
+        }
+    }
     _updateErrno(ret != SOCKET_ERROR);
     return ret != SOCKET_ERROR ? ret : -1;
 }
@@ -212,7 +227,7 @@ int win32_getsockopt(SOCKET sockfd, int level, int optname, void *optval, sockle
 int win32_setsockopt(SOCKET sockfd, int level, int optname, const void *optval, socklen_t optlen) {
     int ret = 0;
     if ((level == SOL_SOCKET) && ((optname == SO_RCVTIMEO) || (optname == SO_SNDTIMEO))) {
-        struct timeval *tv = optval;
+        const struct timeval *tv = optval;
         DWORD timeout = tv->tv_sec * 1000 + tv->tv_usec / 1000;
         ret = setsockopt(sockfd, level, optname, (const char*)&timeout, sizeof(DWORD));
     } else {
@@ -245,4 +260,21 @@ int win32_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     _updateErrno(ret != SOCKET_ERROR);
     return ret != SOCKET_ERROR ? ret : -1;
 }
+
+int win32_redisKeepAlive(SOCKET sockfd, int interval_ms) {
+    struct tcp_keepalive cfg;
+    DWORD bytes_in;
+    int res;
+
+    cfg.onoff = 1;
+    cfg.keepaliveinterval = interval_ms;
+    cfg.keepalivetime = interval_ms;
+
+    res = WSAIoctl(sockfd, SIO_KEEPALIVE_VALS, &cfg,
+                   sizeof(struct tcp_keepalive), NULL, 0,
+                   &bytes_in, NULL, NULL);
+
+    return res == 0 ? 0 : _wsaErrorToErrno(res);
+}
+
 #endif /* _WIN32 */
